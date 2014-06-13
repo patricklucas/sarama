@@ -182,6 +182,85 @@ func (p *Producer) genericSendMessage(topic string, key, value Encoder, synchron
 	return msg.enqueue(p)
 }
 
+type KeyValueEncoder struct {
+	Key   Encoder
+	Value Encoder
+}
+
+// Send a group of messages synchronously. This method returns a kafka error
+// for each partition as SendMessage returns one for the single destination
+// partition. This is a partial, but working, solution to sending multiple
+// messages synchronously: while it works as-advertised, in case of a retry,
+// msg.reenqueue will be called for each message, effectively sending each
+// message synchronously.
+//
+// Notably, this method does not call msg.enqueue(p) at this time.
+func (p *Producer) SendMessages(topic string, messages []KeyValueEncoder) (kafkaErrors []error, err error) {
+	prbs := make(map[*brokerProducer]produceRequestBuilder)
+
+	for _, msg := range messages {
+		var keyBytes, valBytes []byte
+
+		if msg.Key != nil {
+			if keyBytes, err = msg.Key.Encode(); err != nil {
+				return nil, err
+			}
+		}
+		if msg.Value != nil {
+			if valBytes, err = msg.Value.Encode(); err != nil {
+				return nil, err
+			}
+		}
+
+		partition, err := p.choosePartition(topic, msg.Key)
+		if err != nil {
+			return nil, err
+		}
+
+		// produce_message.go
+		msg := &produceMessage{
+			tp:    topicPartition{topic, partition},
+			key:   keyBytes,
+			value: valBytes,
+			sync:  true,
+		}
+
+		bp, err := p.brokerProducerFor(msg.tp)
+		if err != nil {
+			return nil, err
+		}
+
+		_, ok := prbs[bp]
+		if ok == false {
+			prbs[bp] = []*produceMessage{}
+		}
+
+		prbs[bp] = append(prbs[bp], msg)
+	}
+
+	var waitGroup sync.WaitGroup
+
+	errors := make(chan error, len(prbs))
+
+	for bp, prb := range prbs {
+		waitGroup.Add(1)
+		go bp.flushRequest(p, prb, func(err error) {
+			errors <- err
+			waitGroup.Done()
+		})
+	}
+
+	waitGroup.Wait()
+	close(errors)
+
+	var errorList []error
+	for err := range errors {
+		errorList = append(errorList, err)
+	}
+
+	return errorList, nil
+}
+
 func (p *Producer) addMessage(msg *produceMessage) error {
 	bp, err := p.brokerProducerFor(msg.tp)
 	if err != nil {

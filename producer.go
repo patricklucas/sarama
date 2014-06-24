@@ -196,6 +196,7 @@ type KeyValueEncoder struct {
 //
 // Notably, this method does not call msg.enqueue(p) at this time.
 func (p *Producer) SendMessages(topic string, messages []KeyValueEncoder) (kafkaErrors []error, err error) {
+	tps := make(map[topicPartition]bool)
 	prbs := make(map[*brokerProducer]produceRequestBuilder)
 
 	for _, msg := range messages {
@@ -235,15 +236,18 @@ func (p *Producer) SendMessages(topic string, messages []KeyValueEncoder) (kafka
 			prbs[bp] = []*produceMessage{}
 		}
 
+		tps[msg.tp] = true
 		prbs[bp] = append(prbs[bp], msg)
 	}
 
 	var waitGroup sync.WaitGroup
 
-	errors := make(chan error, len(prbs))
+	// flushRequest will invoke the below callback func once for each
+	// topicPartition. I think.
+	errors := make(chan error, len(tps))
 
 	for bp, prb := range prbs {
-		waitGroup.Add(1)
+		waitGroup.Add(len(tps))
 		go bp.flushRequest(p, prb, func(err error) {
 			errors <- err
 			waitGroup.Done()

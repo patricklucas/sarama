@@ -187,82 +187,69 @@ type KeyValueEncoder struct {
 	Value Encoder
 }
 
-// Send a group of messages synchronously. This method returns a kafka error
-// for each partition as SendMessage returns one for the single destination
-// partition. This is a partial, but working, solution to sending multiple
-// messages synchronously: while it works as-advertised, in case of a retry,
+// Send a batch of messages synchronously to a single partition.
+//
+// WARNING: All messages in the batch will be sent to the same partition,
+// selected by invoking the partitioner on the first message of the batch only.
+// If you require that the partitioner be invoked for each message, you must
+// call SendMessage for each message individually.
+//
+// This is a partial--but working--solution to sending a batch of messages
+// synchronously: while it works as-advertised, in case of a retry,
 // msg.reenqueue will be called for each message, effectively sending each
 // message synchronously.
 //
 // Notably, this method does not call msg.enqueue(p) at this time.
-func (p *Producer) SendMessages(topic string, messages []KeyValueEncoder) (kafkaErrors []error, err error) {
-	tps := make(map[topicPartition]bool)
-	prbs := make(map[*brokerProducer]produceRequestBuilder)
+func (p *Producer) SendMessages(topic string, messages []*KeyValueEncoder) error {
+	if len(messages) == 0 {
+		return nil
+	}
+
+	partition, err := p.choosePartition(topic, messages[0].Key)
+	if err != nil {
+		return err
+	}
+
+	tp := topicPartition{topic, partition}
+
+	bp, err := p.brokerProducerFor(tp)
+	if err != nil {
+		return err
+	}
+
+	prb := []*produceMessage{}
 
 	for _, msg := range messages {
 		var keyBytes, valBytes []byte
 
 		if msg.Key != nil {
 			if keyBytes, err = msg.Key.Encode(); err != nil {
-				return nil, err
+				return err
 			}
 		}
 		if msg.Value != nil {
 			if valBytes, err = msg.Value.Encode(); err != nil {
-				return nil, err
+				return err
 			}
-		}
-
-		partition, err := p.choosePartition(topic, msg.Key)
-		if err != nil {
-			return nil, err
 		}
 
 		// produce_message.go
 		msg := &produceMessage{
-			tp:    topicPartition{topic, partition},
+			tp:    tp,
 			key:   keyBytes,
 			value: valBytes,
 			sync:  true,
 		}
 
-		bp, err := p.brokerProducerFor(msg.tp)
-		if err != nil {
-			return nil, err
-		}
-
-		_, ok := prbs[bp]
-		if ok == false {
-			prbs[bp] = []*produceMessage{}
-		}
-
-		tps[msg.tp] = true
-		prbs[bp] = append(prbs[bp], msg)
+		prb = append(prb, msg)
 	}
 
-	var waitGroup sync.WaitGroup
+	// flushRequest will invoke the below callback func only once. I think.
+	bp.flushRequest(p, prb, func(flushRequestError error) {
+		err = flushRequestError
+	})
 
-	// flushRequest will invoke the below callback func once for each
-	// topicPartition. I think.
-	errors := make(chan error, len(tps))
-
-	for bp, prb := range prbs {
-		waitGroup.Add(len(tps))
-		go bp.flushRequest(p, prb, func(err error) {
-			errors <- err
-			waitGroup.Done()
-		})
-	}
-
-	waitGroup.Wait()
-	close(errors)
-
-	var errorList []error
-	for err := range errors {
-		errorList = append(errorList, err)
-	}
-
-	return errorList, nil
+	return err
 }
 
 func (p *Producer) addMessage(msg *produceMessage) error {
